@@ -183,6 +183,19 @@ async function decode(f) { // -> { mono } or, for a real two-sided stereo call, 
 }
 const mixdown = ch => { const o = new Float32Array(ch[0].length); ch.forEach(c => { for (let i = 0; i < o.length; i++) o[i] += c[i] / ch.length; }); return o; };
 
+// Loudness envelope and quantile, shared by the silence/timing passes so the audio is scanned once instead of four times.
+function rmsEnv(pcm, F) {
+  const nf = Math.floor(pcm.length / F), r = new Float32Array(nf);
+  for (let f = 0; f < nf; f++) { let s = 0; const o = f * F; for (let i = 0; i < F; i++) { const v = pcm[o + i]; s += v * v; } r[f] = Math.sqrt(s / F); }
+  return r;
+}
+function pct(r, q) { // q-th quantile; on very long files it is read off a sample, which lands in the same place
+  const n = r.length; if (!n) return 0;
+  const step = Math.max(1, Math.ceil(n / 200000)), m = Math.floor((n + step - 1) / step), s = new Float32Array(m);
+  for (let i = 0, j = 0; j < m; i += step, j++) s[j] = r[i];
+  s.sort(); return s[Math.floor(m * q)] || 0;
+}
+
 /*GAP*/
 // Completeness helpers: boost quiet speech, cut at silence, find speech that has no text.
 function normalize(x) { // gentle automatic gain: quiet passages are boosted (max 10x), loud ones untouched
@@ -202,9 +215,8 @@ function splitPoints(pcm, n) { // n parts, each cut placed in the quietest spot 
   cuts.push(pcm.length); return cuts;
 }
 function findGaps(pcm, segs) { // [start, end] seconds where there is sound but no transcript text
-  const F = 1600, nf = Math.floor(pcm.length / F), r = new Float32Array(nf);
-  for (let f = 0; f < nf; f++) { let s = 0; for (let i = f * F; i < (f + 1) * F; i++) s += pcm[i] * pcm[i]; r[f] = Math.sqrt(s / F); }
-  const floor = Array.from(r).sort((a, b) => a - b)[Math.floor(nf * 0.2)] || 0, th = Math.min(0.03, Math.max(0.012, floor * 4));
+  const r = rmsEnv(pcm, 1600), nf = r.length;
+  const floor = pct(r, 0.2), th = Math.min(0.03, Math.max(0.012, floor * 4));
   const spans = []; let st = -1, last = -1;
   for (let f = 0; f < nf; f++) if (r[f] > th) { if (st < 0) st = last = f; else if (f - last <= 6) last = f; else { spans.push([st, last + 1]); st = last = f; } }
   if (st >= 0) spans.push([st, last + 1]);
@@ -221,35 +233,46 @@ function findGaps(pcm, segs) { // [start, end] seconds where there is sound but 
 // ---------- local engine: Whisper in background workers ----------
 const workerSrc = `
 let pipeline, env;
-async function init() {
+async function init(threads) {
   if (pipeline) return;
   let last;
   for (const v of ${JSON.stringify(TJS_VERSIONS)}) {
-    try { const m = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@' + v); pipeline = m.pipeline; env = m.env; env.allowLocalModels = false; return; }
+    try {
+      const m = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@' + v);
+      pipeline = m.pipeline; env = m.env; env.allowLocalModels = false;
+      // Each worker gets its own slice of the CPU. Left unset, every worker grabs every core and they fight each other.
+      const wa = env.backends && env.backends.onnx && env.backends.onnx.wasm;
+      if (wa) { wa.numThreads = Math.max(1, threads | 0); wa.proxy = false; }
+      return;
+    }
     catch (e) { last = e; }
   }
   throw new Error('Could not load the engine from cdn.jsdelivr.net (' + (last && last.message || last) + '). Check your internet connection or firewall.');
 }
 let asr = null, key = '';
-async function get(model, device, post) {
-  await init();
-  const k = model + device; if (asr && key === k) return asr;
+const noWords = {}; // models that cannot give word times: asking again would transcribe the whole file a second time for nothing
+async function get(model, device, dtype, threads, post) {
+  await init(threads);
+  const k = model + device + dtype; if (asr && key === k) return asr; // thread count is fixed at init, so it is not part of the key
   asr = await pipeline('automatic-speech-recognition', model, {
-    device, dtype: device === 'webgpu' ? 'fp32' : 'q8',
+    device, dtype,
     progress_callback: p => { if (p.status === 'progress') post({ type: 'load', pct: p.progress, file: p.file }); }
   });
   key = k; return asr;
 }
-async function run(d, device) {
+async function run(d, device, dtype) {
   const post = m => self.postMessage(m);
-  const t = await get(d.model, device, post);
-  const total = Math.max(1, Math.ceil(d.duration / 20)); let n = 0;
-  const opts = { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5,
+  const t = await get(d.model, device, dtype, d.threads || 1, post);
+  const stride = d.stride || 5, total = Math.max(1, Math.ceil(d.duration / (30 - stride * 2))); let n = 0;
+  const opts = { return_timestamps: true, chunk_length_s: 30, stride_length_s: stride,
     chunk_callback: () => { n++; post({ type: 'prog', pct: Math.min(99, n / total * 100), device }); } };
   if (!d.model.endsWith('.en')) { opts.task = 'transcribe'; if (d.lang) opts.language = d.lang; }
   post({ type: 'prog', pct: 0, device });
-  try { const out = await t(d.audio, { ...opts, return_timestamps: 'word' }); return { out, words: true }; }
-  catch (err) { n = 0; const out = await t(d.audio, opts); return { out, words: false }; }
+  if (!noWords[d.model]) {
+    try { const out = await t(d.audio, { ...opts, return_timestamps: 'word' }); return { out, words: true }; }
+    catch (err) { noWords[d.model] = 1; n = 0; post({ type: 'prog', pct: 0, device }); }
+  }
+  const out = await t(d.audio, opts); return { out, words: false };
 }
 self.onmessage = async e => {
   const d = e.data;
@@ -257,11 +280,28 @@ self.onmessage = async e => {
     let out;
     let gpu = false;
     try { gpu = !!(self.navigator.gpu && await self.navigator.gpu.requestAdapter()); } catch (err) {}
-    if (gpu) { try { out = await run(d, 'webgpu'); } catch (err) { asr = null; self.postMessage({ type: 'note', text: 'WebGPU failed, using CPU (slower).' }); out = await run(d, 'wasm'); } }
-    else out = await run(d, 'wasm');
+    // Full precision on the GPU. Half precision is faster but returns an empty transcript on some
+    // cards and model sizes, with no error to catch, so it is not worth the risk.
+    if (gpu) { try { out = await run(d, 'webgpu', 'fp32'); } catch (err) { asr = null; self.postMessage({ type: 'note', text: 'WebGPU failed, using CPU (slower).' }); out = await run(d, 'wasm', 'q8'); } }
+    else out = await run(d, 'wasm', 'q8');
     self.postMessage({ type: 'done', chunks: out.out.chunks || [{ text: out.out.text, timestamp: [0, d.duration] }], words: out.words });
   } catch (err) { self.postMessage({ type: 'error', text: String(err && err.message || err) }); }
 };`
+// Workers are kept alive between runs with the model still in memory, so the second file (and the
+// second pass over the first) starts transcribing immediately instead of loading the model again.
+let blobUrl = null; const idleWorkers = []; let idleTimer = 0;
+function takeWorker() {
+  if (!blobUrl) blobUrl = URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }));
+  const w = idleWorkers.pop();
+  if (w) { w.onmessage = null; w.onerror = null; return w; }
+  return new Worker(blobUrl);
+}
+function freeWorkers(ws) { // only ever called with workers that finished cleanly
+  clearTimeout(idleTimer);
+  ws.forEach(w => { w.onmessage = null; w.onerror = null; if (idleWorkers.length < 8) idleWorkers.push(w); else w.terminate(); });
+  idleTimer = setTimeout(() => idleWorkers.splice(0).forEach(w => w.terminate()), 120000); // give the memory back when idle
+}
+
 const warm = {}; // model -> promise: later files wait until the first one has the model loaded (avoids duplicate downloads)
 async function localTranscribe(t, pcm, o) {
   let release = null;
@@ -274,15 +314,17 @@ async function localTranscribe(t, pcm, o) {
   const N = gpu || pcm.length < 90 * SR ? 1 : Math.max(1, Math.min(maxW, share));
   const cuts = splitPoints(pcm, N), pcts = new Array(N).fill(0), results = new Array(N), t0 = Date.now();
   let finished = 0, spawned = false, noteSaid = false, device = 'wasm';
-  const blobUrl = URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }));
+  const mine = []; // this run's workers, handed back to the pool once they are all done
+  const threads = Math.max(1, Math.floor(Math.max(1, (navigator.hardwareConcurrency || 4) - 1) / (N * (o.par || 1))));
+  const stride = o.mode === 'fast' ? 3 : 5; // overlap between 30 s chunks; full overlap keeps accuracy up
   return new Promise((resolve, reject) => {
     t.abortFn = () => reject(cancelErr());
     const shown = () => { const p = pcts.reduce((x, y) => x + y, 0) / N; t.pct = p; t.msg = (t.label || 'Transcribing') + '… ' + Math.round(p) + '%, ' + eta(p, t0) + ' (' + (device === 'webgpu' ? 'GPU' : 'CPU, ' + N + ' parallel worker' + (N > 1 ? 's' : '')) + ')'; paint(t); };
     const start = i => {
       const a = cuts[i], b = cuts[i + 1];
       const slice = pcm.slice(a, b); let w;
-      try { w = new Worker(blobUrl); } catch (e) { return reject(new Error('This browser blocked the background worker: ' + e.message)); }
-      t.workers.push(w);
+      try { w = takeWorker(); } catch (e) { return reject(new Error('This browser blocked the background worker: ' + e.message)); }
+      t.workers.push(w); mine.push(w);
       w.onerror = e => reject(new Error('The transcription engine failed to start: ' + (e.message || 'the browser blocked the background worker') + '. Try opening the folder with VS Code Live Server (http://localhost) instead of double-clicking index.html.'));
       w.onmessage = e => {
         const m = e.data;
@@ -300,10 +342,13 @@ async function localTranscribe(t, pcm, o) {
             .filter(c => c.text);
           if (!m.words && !noteSaid) { noteSaid = true; say('Word-level timing is not available for this model, so timing is per sentence.'); }
           pcts[i] = 100; shown();
-          if (++finished === N) resolve(results.flat().sort((x, y) => x.start - y.start));
+          if (++finished === N) {
+            t.workers = t.workers.filter(x => mine.indexOf(x) < 0); freeWorkers(mine);
+            resolve(results.flat().sort((x, y) => x.start - y.start));
+          }
         }
       };
-      w.postMessage({ model: o.model, lang: o.lang, audio: slice, duration: (b - a) / SR }, [slice.buffer]);
+      w.postMessage({ model: o.model, lang: o.lang, audio: slice, duration: (b - a) / SR, threads, stride }, [slice.buffer]);
     };
     t.msg = 'Starting engine…'; paint(t); start(0);
   }).finally(() => { if (release) release(); });
@@ -312,11 +357,12 @@ async function localTranscribe(t, pcm, o) {
 // ---------- cloud engine: Groq Whisper API (optional, fast) ----------
 /*WAV*/
 function wavBlob(f) { // 16 kHz mono 16-bit WAV
-  const n = f.length, b = new DataView(new ArrayBuffer(44 + n * 2)), w = (o, t) => [...t].forEach((c, i) => b.setUint8(o + i, c.charCodeAt(0)));
+  const n = f.length, b = new DataView(new ArrayBuffer(44)), w = (o, t) => [...t].forEach((c, i) => b.setUint8(o + i, c.charCodeAt(0)));
   w(0, 'RIFF'); b.setUint32(4, 36 + n * 2, true); w(8, 'WAVEfmt '); b.setUint32(16, 16, true); b.setUint16(20, 1, true); b.setUint16(22, 1, true);
   b.setUint32(24, 16000, true); b.setUint32(28, 32000, true); b.setUint16(32, 2, true); b.setUint16(34, 16, true); w(36, 'data'); b.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) b.setInt16(44 + i * 2, Math.max(-1, Math.min(1, f[i])) * 32767, true);
-  return new Blob([b], { type: 'audio/wav' });
+  const pcm = new Int16Array(n); // written straight into a typed array: far quicker than a DataView call per sample
+  for (let i = 0; i < n; i++) { const v = f[i]; pcm[i] = v >= 1 ? 32767 : v <= -1 ? -32767 : v * 32767; }
+  return new Blob([b.buffer, pcm.buffer], { type: 'audio/wav' });
 }
 /*ENDWAV*/
 async function cloudTranscribe(t, pcm, o) {
@@ -327,7 +373,7 @@ async function cloudTranscribe(t, pcm, o) {
   const parts = await Promise.all(Array.from({ length: n }, async (_, i) => {
     const a = cuts[i], fd = new FormData();
     fd.append('file', wavBlob(pcm.subarray(a, cuts[i + 1])), 'part.wav');
-    fd.append('model', 'whisper-large-v3-turbo'); fd.append('response_format', 'verbose_json'); fd.append('timestamp_granularities[]', 'word'); fd.append('timestamp_granularities[]', 'segment');
+    fd.append('model', o.mode === 'accurate' ? 'whisper-large-v3' : 'whisper-large-v3-turbo'); fd.append('response_format', 'verbose_json'); fd.append('timestamp_granularities[]', 'word'); fd.append('timestamp_granularities[]', 'segment');
     if (o.lang) fd.append('language', o.lang);
     let r;
     for (let k = 0; ; k++) {
@@ -368,10 +414,9 @@ async function makePlayable(t, pcm) {
   idb.putBlob(t.id + ':play', blob).catch(() => {}); persist(t);
   if (t === cur) { audio.pause(); audio.src = t.playUrl; }
 }
-function snapEdges(segs, pcm) { // move sentence start/end to where the sound really begins/stops (after pauses)
-  const F = 160, nf = Math.floor(pcm.length / F), r = new Float32Array(nf);
-  for (let f = 0; f < nf; f++) { let s = 0; for (let i = f * F; i < (f + 1) * F; i++) s += pcm[i] * pcm[i]; r[f] = Math.sqrt(s / F); }
-  const th = Math.min(0.03, Math.max(0.01, (Array.from(r).sort((a, b) => a - b)[Math.floor(nf * 0.2)] || 0) * 4));
+function snapEdges(segs, pcm, r0) { // move sentence start/end to where the sound really begins/stops (after pauses)
+  const r = r0 || rmsEnv(pcm, 160), nf = r.length;
+  const th = Math.min(0.03, Math.max(0.01, pct(r, 0.2) * 4));
   const on = f => r[f] > th && r[f + 1] > th && r[f + 2] > th;
   segs.forEach((s, k) => {
     const prevEnd = k ? segs[k - 1].end : 0, nextStart = k + 1 < segs.length ? segs[k + 1].start : Infinity;
@@ -388,9 +433,8 @@ function snapEdges(segs, pcm) { // move sentence start/end to where the sound re
   });
 }
 function compact(pcm) { // cut long silences before transcribing (big time saver); null if little would be saved
-  const F = 1600, nf = Math.floor(pcm.length / F), r = new Float32Array(nf);
-  for (let f = 0; f < nf; f++) { let e = 0; for (let i = f * F; i < (f + 1) * F; i++) e += pcm[i] * pcm[i]; r[f] = Math.sqrt(e / F); }
-  const th = Math.min(0.03, Math.max(0.006, (Array.from(r).sort((a, b) => a - b)[Math.floor(nf * 0.2)] || 0) * 3)), spans = []; let st = -1, last = -1;
+  const F = 1600, r = rmsEnv(pcm, F), nf = r.length;
+  const th = Math.min(0.03, Math.max(0.006, pct(r, 0.2) * 3)), spans = []; let st = -1, last = -1;
   for (let f = 0; f < nf; f++) if (r[f] > th) { if (st < 0) st = last = f; else if (f - last <= 15) last = f; else { spans.push([st, last + 1]); st = last = f; } }
   if (st >= 0) spans.push([st, last + 1]);
   const merged = []; for (const [a, b] of spans) { const x = [Math.max(0, a - 4) * F, Math.min(nf, b + 4) * F], l = merged[merged.length - 1]; if (l && x[0] <= l[1]) l[1] = Math.max(l[1], x[1]); else merged.push(x); }
@@ -408,10 +452,9 @@ function remap(items, map) { // put times found in the shortened audio back onto
   }
   return res;
 }
-function tighten(segs, pcm) { // keep words on the voiced sound; drop lines that sit over silence (typical Whisper inventions)
-  const F = 160, nf = Math.floor(pcm.length / F), r = new Float32Array(nf);
-  for (let f = 0; f < nf; f++) { let e = 0; for (let i = f * F; i < (f + 1) * F; i++) e += pcm[i] * pcm[i]; r[f] = Math.sqrt(e / F); }
-  const th = Math.min(0.03, Math.max(0.01, (Array.from(r).sort((a, b) => a - b)[Math.floor(nf * 0.2)] || 0) * 4)), v = new Uint8Array(nf);
+function tighten(segs, pcm, r0) { // keep words on the voiced sound; drop lines that sit over silence (typical Whisper inventions)
+  const r = r0 || rmsEnv(pcm, 160), nf = r.length;
+  const th = Math.min(0.03, Math.max(0.01, pct(r, 0.2) * 4)), v = new Uint8Array(nf);
   for (let f = 0; f < nf; f++) v[f] = r[f] > th ? 1 : 0;
   for (let f = 1; f < nf - 6; f++) if (!v[f] && v[f - 1]) for (let k = 1; k <= 6; k++) if (v[f + k]) { for (let j = 0; j < k; j++) v[f + j] = 1; break; }
   const frac = (a, b) => { const i0 = Math.max(0, Math.floor(a * 100)), i1 = Math.min(nf, Math.ceil(b * 100)); let c = 0; for (let i = i0; i < i1; i++) c += v[i]; return i1 > i0 ? c / (i1 - i0) : 0; };
@@ -464,7 +507,8 @@ async function transcribe(t, o) {
       if (cp) items = remap(items, cp.map);
       let segs = toSegs(items);
       if (!fast) try { rec += await recover(t, pcm, oo, segs); } catch (e) { if (e.name === 'AbortError' || t.cancelled) throw e; }
-      snapEdges(segs, pcm); segs = tighten(segs, pcm);
+      const env = rmsEnv(pcm, 160);
+      snapEdges(segs, pcm, env); segs = tighten(segs, pcm, env);
       segs.forEach(x => x.spk = c); all.push(...segs);
     }
     t.segs = all.sort((x, y) => x.start - y.start);
