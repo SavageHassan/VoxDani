@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoxDani</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" style="fill:var(--acc)"/><path d="M9 13v6M13 9v14M17 12v8M21 7v18M25 13v6" stroke="#fff" stroke-width="2.4" stroke-linecap="round" fill="none"/></svg>
+    <div><h1>VoxDani</h1><p class="sub">Audio to text with exact timestamps</p></div>
+  </div>
+  <div class="tools">
+    <div class="palette" role="group" aria-label="Accent colour">
+      <button class="sw" type="button" data-c="teal" title="Teal" aria-label="Teal" style="background:linear-gradient(135deg,#0b7a83,#19b3a6)"></button>
+      <button class="sw" type="button" data-c="blue" title="Blue" aria-label="Blue" style="background:linear-gradient(135deg,#1d5fd1,#3b9cf0)"></button>
+      <button class="sw" type="button" data-c="indigo" title="Indigo" aria-label="Indigo" style="background:linear-gradient(135deg,#4338ca,#7c6cf0)"></button>
+      <button class="sw" type="button" data-c="rose" title="Rose" aria-label="Rose" style="background:linear-gradient(135deg,#be1d55,#f0568a)"></button>
+      <button class="sw" type="button" data-c="orange" title="Orange" aria-label="Orange" style="background:linear-gradient(135deg,#c2540a,#f59e0b)"></button>
+      <button class="sw" type="button" data-c="green" title="Green" aria-label="Green" style="background:linear-gradient(135deg,#17803d,#4cc07a)"></button>
+      <label class="sw custom" title="Pick any colour"><input id="customColor" type="color" value="#0b7a83" aria-label="Custom colour"></label>
+    </div>
+    <button id="themeBtn" class="ghost" type="button">Dark theme</button>
+  </div>
+</header>
+<div id="msg" class="msg" role="status" hidden></div>
+<nav id="tabs" class="tabs" aria-label="Audio files" hidden></nav>
+<main class="grid">
+  <section class="side">
+    <div id="drop" class="drop" tabindex="0">
+      <svg class="up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+      <p><strong>Drop audio files here</strong> or <label class="link" for="file">choose one</label></p>
+      <p class="small">MP3, WAV, M4A, AAC, OGG, FLAC. Add as many files as you like. Each opens in its own tab. Up to 2 hours each.</p>
+      <input id="file" type="file" multiple accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac" hidden>
+    </div>
+    <dl id="info" class="info" hidden>
+      <dt>File</dt><dd id="iName"></dd>
+      <dt>Duration</dt><dd id="iDur"></dd>
+      <dt>Size</dt><dd id="iSize"></dd>
+    </dl>
+
+    <div class="card">
+      <h2>Transcription</h2>
+      <label>Engine
+        <select id="engine">
+          <option value="local">On this PC: private, slower</option>
+          <option value="cloud">Cloud (Groq): very fast, audio is uploaded</option>
+        </select>
+      </label>
+      <label>Speed
+        <select id="mode">
+          <option value="fast">Fast: smallest model, skips silence, no second check</option>
+          <option value="balanced" selected>Balanced: skips silence, then checks for missed speech</option>
+          <option value="accurate">Accurate: slowest, nothing skipped</option>
+        </select>
+      </label>
+      <p class="small">Fast uses the Tiny model, so it is less accurate. For the biggest speed-up use Cloud.</p>
+      <label class="small"><input id="sides" type="checkbox" checked> Stereo calls: transcribe each side separately (adds speaker labels, takes longer)</label>
+      <label>Files at once
+        <select id="par">
+          <option value="1">1 (one after another)</option>
+          <option value="2" selected>2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+      </label>
+      <p class="small">With Cloud, files really finish faster together. On this PC they share the same CPU, so each one is slower, and the total time is about the same.</p>
+      <div id="keyRow" hidden>
+        <label>Groq API key<input id="key" type="password" autocomplete="off" placeholder="gsk_..."></label>
+        <p class="small">Get a free key at console.groq.com. It is saved only in this browser. Your audio is sent to Groq for transcription.</p>
+      </div>
+      <div class="row">
+        <label>Model
+          <select id="model">
+            <option value="Xenova/whisper-tiny.en">Tiny, English (~40 MB, fastest)</option>
+            <option value="Xenova/whisper-base.en" selected>Base, English (~80 MB)</option>
+            <option value="Xenova/whisper-small.en">Small, English (~250 MB, most accurate)</option>
+            <option value="Xenova/whisper-tiny">Tiny, multilingual</option>
+            <option value="Xenova/whisper-base">Base, multilingual</option>
+            <option value="Xenova/whisper-small">Small, multilingual</option>
+          </select>
+        </label>
+        <label>Language
+          <select id="lang">
+            <option value="">Auto-detect</option><option value="en">English</option><option value="ur">Urdu</option>
+            <option value="hi">Hindi</option><option value="ar">Arabic</option><option value="es">Spanish</option>
+            <option value="fr">French</option><option value="de">German</option><option value="pt">Portuguese</option><option value="zh">Chinese</option>
+          </select>
+        </label>
+      </div>
+      <p class="small">Language applies to multilingual models only.</p>
+      <div class="row">
+        <button id="goBtn" type="button" class="primary" disabled>Transcribe this file</button>
+        <button id="goAll" type="button" disabled>Transcribe all</button>
+        <button id="cancelBtn" type="button" hidden>Cancel this file</button>
+      </div>
+      <div id="progWrap" hidden>
+        <progress id="prog" max="100" value="0"></progress>
+        <p id="progTxt" class="small"></p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Player</h2>
+      <audio id="audio" preload="metadata"></audio>
+      <input id="seek" type="range" min="0" max="1000" value="0" disabled aria-label="Progress">
+      <div class="time"><span id="cur">0:00</span><span id="tot">0:00</span></div>
+      <div class="row ctl">
+        <button id="back" type="button" disabled>−5s</button>
+        <button id="play" type="button" class="primary" disabled>Play</button>
+        <button id="stop" type="button" disabled>Stop</button>
+        <button id="fwd" type="button" disabled>+5s</button>
+      </div>
+      <div class="row ctl">
+        <button id="mute" type="button">Mute</button>
+        <input id="vol" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+        <select id="speed" aria-label="Speed">
+          <option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option><option>2</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Speakers</h2>
+      <p class="small">Whisper cannot tell voices apart, so assign speakers yourself using the menu on each line.</p>
+      <div id="spk"></div>
+      <button id="addSpk" type="button">Add speaker</button>
+    </div>
+  </section>
+
+  <section class="main">
+    <div class="bar">
+      <input id="search" type="search" placeholder="Search transcript" aria-label="Search transcript">
+      <span id="hits" class="small"></span>
+      <label class="small"><input id="auto" type="checkbox" checked> Follow audio</label>
+      <span class="grow"></span>
+      <label class="small" title="Move every timestamp earlier (negative) or later (positive)">Shift all by <input id="shiftBy" type="number" step="0.1" value="0" style="width:64px"> s</label>
+      <button id="shiftBtn" type="button" disabled>Apply</button>
+      <button id="copy" type="button" disabled>Copy</button>
+      <label class="small" title="MP3 and WAV copies get one marker per transcript line (other formats are copied unchanged)"><input id="mark" type="checkbox" checked> Markers in audio</label>
+      <label class="small" title="Also save a WAV copy (16 kHz) with cue markers, which Adobe Audition always reads"><input id="wavcopy" type="checkbox"> WAV copy for Audition</label>
+      <button id="folder" type="button" disabled title="Save the audio and transcripts together in a folder">Save folder</button>
+      <button id="saveAll" type="button" disabled title="Save a folder for every finished file">Save all folders</button>
+      <button id="txt" type="button" disabled>TXT</button>
+      <button id="srt" type="button" disabled>SRT</button>
+      <button id="csv" type="button" disabled>CSV</button>
+    </div>
+    <div id="tr" class="tr"><p class="empty">Your transcript will appear here. Add a file, then press Transcribe.</p></div>
+  </section>
+</main>
+<footer class="foot">Developed by <strong>Daniyal Umer (Dani)</strong></footer>
+<script src="script.js"></script>
+</body>
+</html>
