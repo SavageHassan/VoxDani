@@ -129,7 +129,8 @@ function update() {
   enable(ok); $('goBtn').disabled = !ok || busy; $('cancelBtn').hidden = !busy;
   const n = tabs.filter(x => x.dur > 0 && (x.status === 'ready' || x.status === 'error')).length;
   $('goAll').disabled = !n; $('goAll').textContent = 'Transcribe all' + (n ? ' (' + n + ')' : '');
-  $('saveAll').disabled = !tabs.some(x => x.status === 'done');
+  const anyDone = tabs.some(x => x.status === 'done');
+  $('saveAll').disabled = !anyDone; $('docAll').disabled = !anyDone;
   const has = !!t && t.segs.length > 0; ['copy', 'folder', 'txt', 'srt', 'csv', 'shiftBtn'].forEach(i => $(i).disabled = !has);
   const showP = !!t && (busy || t.status === 'error'); $('progWrap').hidden = !showP;
   if (showP) { $('prog').hidden = t.status === 'error'; paint(t); }
@@ -597,6 +598,65 @@ const asTxt = t => t.segs.map(s => '[' + fmt(s.start) + '] ' + spk(t, s) + ': ' 
 const asSrt = t => t.segs.map((s, i) => (i + 1) + '\n' + fmt(s.start, 1) + ' --> ' + fmt(Math.max(s.end, s.start + 0.5), 1) + '\n' + spk(t, s) + ': ' + s.text + '\n').join('\n');
 const q = v => '"' + String(v).replace(/"/g, '""') + '"';
 const asCsv = t => '\ufeffstart,end,speaker,text\r\n' + t.segs.map(s => [fmt(s.start, 1), fmt(s.end, 1), q(spk(t, s)), q(s.text)].join(',')).join('\r\n');
+/*DOCX*/
+// ---- one Word document holding every finished file, each under its own heading ----
+const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+const xmlEsc = v => String(v).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function wRun(r) { // one stretch of text with its own look
+  const pr = [];
+  if (r.b) pr.push('<w:b/>');
+  if (r.i) pr.push('<w:i/>');
+  if (r.color) pr.push('<w:color w:val="' + r.color + '"/>');
+  if (r.sz) pr.push('<w:sz w:val="' + r.sz + '"/><w:szCs w:val="' + r.sz + '"/>');
+  return '<w:r>' + (pr.length ? '<w:rPr>' + pr.join('') + '</w:rPr>' : '') + '<w:t xml:space="preserve">' + xmlEsc(r.t) + '</w:t></w:r>';
+}
+function wPara(runs, o) {
+  o = o || {}; const pr = [];
+  if (o.style) pr.push('<w:pStyle w:val="' + o.style + '"/>');
+  if (o.page) pr.push('<w:pageBreakBefore/>');
+  return '<w:p>' + (pr.length ? '<w:pPr>' + pr.join('') + '</w:pPr>' : '') + (runs || []).map(wRun).join('') + '</w:p>';
+}
+const DOCX_TYPES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+  '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+  '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+  '<Default Extension="xml" ContentType="application/xml"/>' +
+  '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+  '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>';
+const DOCX_RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+  '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+  '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>';
+const DOCX_DOCRELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+  '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+  '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+const DOCX_STYLES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:styles xmlns:w="' + W_NS + '">' +
+  '<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault>' +
+  '<w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>' +
+  '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>' +
+  '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:qFormat/>' +
+  '<w:pPr><w:spacing w:after="60"/></w:pPr><w:rPr><w:b/><w:sz w:val="52"/><w:szCs w:val="52"/></w:rPr></w:style>' +
+  '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>' +
+  '<w:pPr><w:outlineLvl w:val="0"/><w:spacing w:before="360" w:after="160"/></w:pPr>' +
+  '<w:rPr><w:b/><w:color w:val="1F3864"/><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr></w:style></w:styles>';
+function docxBlob(list) { // every finished file in one .docx, split by the audio file name
+  const body = [wPara([{ t: 'Transcripts' }], { style: 'Title' }),
+    wPara([{ t: list.length + (list.length === 1 ? ' file' : ' files') + '  ·  ' + new Date().toLocaleString(), color: '707070', sz: 18 }])];
+  list.forEach((t, k) => {
+    body.push(wPara([{ t: t.file.name }], { style: 'Heading1', page: k > 0 })); // each file starts a new page
+    if (!t.segs.length) { body.push(wPara([{ t: 'No speech was detected in this file.', i: true, color: '707070' }])); return; }
+    t.segs.forEach(s => body.push(wPara([
+      { t: '[' + fmt(s.start) + ']  ' + spk(t, s) + ': ', b: true, color: '1F3864' },
+      { t: s.text }
+    ])));
+  });
+  const doc = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document xmlns:w="' + W_NS + '"><w:body>' + body.join('') +
+    '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"/></w:sectPr></w:body></w:document>';
+  const enc = new TextEncoder();
+  // [Content_Types].xml has to be the first entry in the package, so the order here matters.
+  const files = [['[Content_Types].xml', DOCX_TYPES], ['_rels/.rels', DOCX_RELS], ['word/_rels/document.xml.rels', DOCX_DOCRELS],
+    ['word/document.xml', doc], ['word/styles.xml', DOCX_STYLES]].map(x => ({ name: x[0], data: enc.encode(x[1]) }));
+  return new Blob([makeZip(files)], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+}
+/*ENDDOCX*/
 function download(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); return name; }
 function save(ext, text, type) { if (cur) say('Downloaded ' + download(new Blob([text], { type }), safe(cur.file.name) + ext), 'ok'); }
 $('shiftBtn').onclick = () => {
@@ -739,6 +799,10 @@ async function saveFolders(list, zipName) {
 }
 $('folder').onclick = () => cur && saveFolders([cur], safe(cur.file.name));
 $('saveAll').onclick = () => saveFolders(tabs.filter(x => x.status === 'done'), 'transcripts');
+$('docAll').onclick = () => {
+  const list = tabs.filter(x => x.status === 'done'); if (!list.length) return;
+  say('Downloaded ' + download(docxBlob(list), 'transcripts.docx') + ': ' + list.length + (list.length === 1 ? ' file' : ' files') + ', each under its own name.', 'ok');
+};
 
 drawSpeakers(); render(); update();
 
